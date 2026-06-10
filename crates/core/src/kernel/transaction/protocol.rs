@@ -299,6 +299,11 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::DeletionVectors);
     reader_features.insert(TableFeature::VariantType);
     reader_features.insert(TableFeature::VariantTypePreview);
+    // V2 checkpoints only affect log-replay/checkpoint discovery; the kernel marks
+    // V2Checkpoint as KernelSupport::Supported, so reads are safe. delta-rs upstream
+    // simply never added it to this reader allowlist, which blocks reading any table
+    // that declares the v2Checkpoint reader feature (e.g. UC managed Delta tables).
+    reader_features.insert(TableFeature::V2Checkpoint);
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
