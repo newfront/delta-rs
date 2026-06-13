@@ -304,6 +304,16 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     // simply never added it to this reader allowlist, which blocks reading any table
     // that declares the v2Checkpoint reader feature (e.g. UC managed Delta tables).
     reader_features.insert(TableFeature::V2Checkpoint);
+    // Catalog-managed (CCv2) tables declare the catalogManaged (and/or its preview
+    // spelling catalogOwned-preview) plus vacuumProtocolCheck reader-writer features.
+    // The kernel supports all three for Scan (VacuumProtocolCheck => KernelSupport::Supported;
+    // CatalogManaged/CatalogOwnedPreview => Custom with Operation::Scan => Ok), so reads are
+    // safe; delta-rs upstream simply never added them to this allowlist, which blocks reading
+    // any UC managed Delta table with
+    // "Unsupported table features required: [VacuumProtocolCheck, CatalogManaged]".
+    reader_features.insert(TableFeature::CatalogManaged);
+    reader_features.insert(TableFeature::CatalogOwnedPreview);
+    reader_features.insert(TableFeature::VacuumProtocolCheck);
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
