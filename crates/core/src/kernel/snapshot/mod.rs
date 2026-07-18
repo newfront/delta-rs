@@ -77,6 +77,14 @@ pub struct Snapshot {
     materialized_files: Option<Arc<MaterializedFiles>>,
 }
 
+/// True if `err` is the kernel guard that refuses to load a catalog-managed (CCv2) table
+/// without an explicit `max_catalog_version` upper bound. Kernel only emits this for tables
+/// carrying the `catalogManaged`/`catalogOwnedPreview` reader-writer feature.
+fn is_catalog_managed_without_max_version(err: &DeltaTableError) -> bool {
+    err.to_string()
+        .contains("Catalog-managed table requires max_catalog_version")
+}
+
 impl Snapshot {
     pub async fn try_new_with_engine(
         engine: Arc<dyn Engine>,
@@ -84,10 +92,28 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
+        Self::try_new_with_engine_inner(engine, table_root, config, version, None).await
+    }
+
+    /// Like [`Snapshot::try_new_with_engine`], but allows capping the snapshot at a
+    /// catalog-ratified version. Catalog-managed (CCv2) tables carry the `catalogManaged`
+    /// (or `catalogOwnedPreview`) table feature, and kernel refuses to load them from the
+    /// filesystem alone unless an explicit `max_catalog_version` upper bound is supplied
+    /// (the catalog, not the filesystem, is the source of truth for the latest version).
+    async fn try_new_with_engine_inner(
+        engine: Arc<dyn Engine>,
+        table_root: Url,
+        config: DeltaTableConfig,
+        version: Option<Version>,
+        max_catalog_version: Option<Version>,
+    ) -> DeltaResult<Self> {
         let snapshot = match spawn_blocking_with_span(move || {
             let mut builder = KernelSnapshot::builder_for(table_root);
             if let Some(version) = version {
                 builder = builder.at_version(version);
+            }
+            if let Some(max_catalog_version) = max_catalog_version {
+                builder = builder.with_max_catalog_version(max_catalog_version);
             }
             builder.build(engine.as_ref())
         })
@@ -129,7 +155,29 @@ impl Snapshot {
             table_root.set_path(&format!("{}/", table_root.path()));
         }
 
-        Self::try_new_with_engine(engine, table_root, config, version).await
+        match Self::try_new_with_engine_inner(
+            engine.clone(),
+            table_root.clone(),
+            config.clone(),
+            version,
+            None,
+        )
+        .await
+        {
+            Ok(snapshot) => Ok(snapshot),
+            // Catalog-managed (CCv2) tables make the catalog the source of truth for the
+            // latest ratified version, so kernel rejects a path-based load that has no
+            // `max_catalog_version` bound. We have no catalog commit client here, so fall
+            // back to the latest version *published* into `_delta_log/` (exactly what a
+            // filesystem reader sees) and use it as the catalog bound. Unpublished/staged
+            // catalog commits are intentionally not surfaced by this filesystem read path.
+            Err(e) if is_catalog_managed_without_max_version(&e) => {
+                let latest = log_store.get_latest_version(version.unwrap_or(0)).await?;
+                Self::try_new_with_engine_inner(engine, table_root, config, version, Some(latest))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn scan_builder(&self) -> ScanBuilder {
