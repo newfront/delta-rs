@@ -425,6 +425,11 @@ pub struct TemporaryTableCredentials {
     pub r2_temp_credentials: Option<R2TempCredentials>,
     #[serde(with = "chrono::serde::ts_milliseconds")]
     pub expiration_time: DateTime<Utc>,
+    /// Signed URL for the table root. Databricks-managed UC returns this, but the
+    /// open-source Unity Catalog `/temporary-table-credentials` response omits it, so
+    /// tolerate its absence (defaults to empty) rather than failing deserialization of
+    /// the whole untagged `TableTempCredentialsResponse`.
+    #[serde(default)]
     pub url: String,
 }
 
@@ -818,5 +823,47 @@ pub(crate) mod tests {
         assert!(get_table.is_ok());
         dbg!(&get_table);
         assert!(matches!(get_table.unwrap(), GetTableResponse::Error(_)))
+    }
+
+    // Open-source Unity Catalog's `POST /temporary-table-credentials` (operation=READ)
+    // returns aws_temp_credentials + expiration_time but no `url` field (see the
+    // `TemporaryCredentials` schema in the UC OpenAPI spec). Before `url` was made
+    // `#[serde(default)]`, the missing field failed the `TemporaryTableCredentials`
+    // variant and, because `TableTempCredentialsResponse` is `#[serde(untagged)]`,
+    // surfaced as an opaque "error decoding response body". Guard that exact shape.
+    pub(crate) const OSS_TEMP_TABLE_CREDENTIALS_NO_URL: &str = r#"
+        {
+            "aws_temp_credentials": {
+                "access_key_id": "AKIAOSSEXAMPLE",
+                "secret_access_key": "oss-secret",
+                "session_token": "oss-session-token"
+            },
+            "expiration_time": 1700000000000
+        }
+    "#;
+
+    #[test]
+    fn test_temp_table_credentials_without_url() {
+        let resp: Result<TableTempCredentialsResponse, _> =
+            serde_json::from_str(OSS_TEMP_TABLE_CREDENTIALS_NO_URL);
+        assert!(
+            resp.is_ok(),
+            "OSS UC temp-cred body (no `url`) must deserialize: {resp:?}"
+        );
+        let creds = match resp.unwrap() {
+            TableTempCredentialsResponse::Success(c) => c,
+            TableTempCredentialsResponse::Error(e) => {
+                panic!("expected Success, got Error variant: {e:?}")
+            }
+        };
+        // `url` is absent on the wire -> defaulted, and the AWS creds still decode.
+        assert_eq!(creds.url, "");
+        let aws = creds
+            .aws_temp_credentials
+            .as_ref()
+            .expect("aws_temp_credentials present");
+        assert_eq!(aws.access_key_id, "AKIAOSSEXAMPLE");
+        assert_eq!(aws.secret_access_key, "oss-secret");
+        assert_eq!(aws.session_token.as_deref(), Some("oss-session-token"));
     }
 }
